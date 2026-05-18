@@ -1,4 +1,6 @@
 import 'dart:io';
+import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart'; // Library OSM
 import 'package:latlong2/latlong.dart'; // Helper Koordinat
@@ -29,11 +31,149 @@ class _RiwayatMapsPageState extends State<RiwayatMapsPage> {
   late LatLng _initialCenter;
   double _initialZoom = 5.0;
 
+  // --- SEARCH ---
+  final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode();
+  List<UbinanHistory> _allData = [];
+  List<UbinanHistory> _searchResults = [];
+  bool _isSearchExpanded = false;
+
+  // --- GEOCODING (Pencarian Tempat) ---
+  List<Map<String, dynamic>> _placeResults = [];
+  bool _isSearchingPlaces = false;
+  Timer? _debounceTimer;
+
   @override
   void initState() {
     _initialCenter = const LatLng(-2.5489, 118.0149);
     super.initState();
     _loadData();
+
+    // Tutup search saat focus hilang
+    _searchFocusNode.addListener(() {
+      if (!_searchFocusNode.hasFocus && _searchController.text.isEmpty) {
+        setState(() => _isSearchExpanded = false);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _debounceTimer?.cancel();
+    _searchController.dispose();
+    _searchFocusNode.dispose();
+    _mapController.dispose();
+    super.dispose();
+  }
+
+  // --- SEARCH FUNCTIONS ---
+  void _onSearchChanged(String query) {
+    // Filter data lokal
+    if (query.isEmpty) {
+      setState(() {
+        _searchResults = [];
+        _placeResults = [];
+      });
+      _debounceTimer?.cancel();
+      return;
+    }
+
+    final lowerQuery = query.toLowerCase();
+    setState(() {
+      _searchResults = _allData.where((data) {
+        return data.title.toLowerCase().contains(lowerQuery) ||
+            data.cropType.toLowerCase().contains(lowerQuery) ||
+            (data.farmerName?.toLowerCase().contains(lowerQuery) ?? false) ||
+            (data.poktanName?.toLowerCase().contains(lowerQuery) ?? false) ||
+            (data.locationName?.toLowerCase().contains(lowerQuery) ?? false) ||
+            (data.surveyorName?.toLowerCase().contains(lowerQuery) ?? false) ||
+            data.date.toLowerCase().contains(lowerQuery);
+      }).toList();
+    });
+
+    // Debounce geocoding API (tunggu 500ms setelah user berhenti mengetik)
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 500), () {
+      _searchPlaces(query);
+    });
+  }
+
+  // --- GEOCODING: Cari nama tempat via Nominatim (OpenStreetMap) ---
+  Future<void> _searchPlaces(String query) async {
+    if (query.length < 3) {
+      setState(() => _placeResults = []);
+      return;
+    }
+
+    setState(() => _isSearchingPlaces = true);
+
+    try {
+      final uri = Uri.parse(
+        'https://nominatim.openstreetmap.org/search'
+        '?q=${Uri.encodeComponent(query)}'
+        '&format=json'
+        '&addressdetails=1'
+        '&limit=5'
+        '&countrycodes=id',  // Prioritas Indonesia
+      );
+
+      final client = HttpClient();
+      client.userAgent = 'SI-UBIN/1.0';
+      final request = await client.getUrl(uri);
+      final response = await request.close();
+
+      if (response.statusCode == 200) {
+        final body = await response.transform(utf8.decoder).join();
+        final List<dynamic> data = json.decode(body);
+
+        if (mounted && _searchController.text.isNotEmpty) {
+          setState(() {
+            _placeResults = data.map<Map<String, dynamic>>((item) {
+              return {
+                'name': item['display_name'] ?? '',
+                'lat': double.tryParse(item['lat']?.toString() ?? '') ?? 0,
+                'lon': double.tryParse(item['lon']?.toString() ?? '') ?? 0,
+                'type': item['type'] ?? '',
+              };
+            }).toList();
+          });
+        }
+      }
+      client.close();
+    } catch (e) {
+      debugPrint('❌ Geocoding error: $e');
+    } finally {
+      if (mounted) setState(() => _isSearchingPlaces = false);
+    }
+  }
+
+  // --- NAVIGASI KE TEMPAT (dari geocoding) ---
+  void _goToPlace(Map<String, dynamic> place) {
+    _searchFocusNode.unfocus();
+    setState(() {
+      _isSearchExpanded = false;
+      _searchController.clear();
+      _searchResults = [];
+      _placeResults = [];
+    });
+
+    _mapController.move(LatLng(place['lat'], place['lon']), 15);
+  }
+
+  void _goToDataLocation(UbinanHistory data) {
+    _searchFocusNode.unfocus();
+    setState(() {
+      _isSearchExpanded = false;
+      _searchController.clear();
+      _searchResults = [];
+      _placeResults = [];
+    });
+
+    _mapController.move(LatLng(data.latitude, data.longitude), 17);
+
+    Future.delayed(const Duration(milliseconds: 400), () {
+      if (mounted) _showDetailDialog(data);
+    });
   }
 
   // --- 1. FUNGSI LOAD DATA ---
@@ -46,6 +186,7 @@ class _RiwayatMapsPageState extends State<RiwayatMapsPage> {
         setState(() {
           _isLoading = false;
           _markers = [];
+          _allData = [];
         });
       }
       return;
@@ -123,6 +264,7 @@ class _RiwayatMapsPageState extends State<RiwayatMapsPage> {
     if (mounted) {
       setState(() {
         _markers = tempMarkers;
+        _allData = dataList; // Simpan data untuk pencarian
         _isLoading = false;
       });
     }
@@ -636,7 +778,7 @@ class _RiwayatMapsPageState extends State<RiwayatMapsPage> {
                                   ),
                                   const SizedBox(width: 4),
                                   const Text(
-                                    "Ton/Ha",
+                                    "Ton",
                                     style: TextStyle(
                                       color: Colors.white,
                                       fontWeight: FontWeight.w600,
@@ -955,6 +1097,282 @@ class _RiwayatMapsPageState extends State<RiwayatMapsPage> {
     );
   }
 
+  // --- WIDGET SEARCH BAR ---
+  Widget _buildSearchBar() {
+    return Positioned(
+      top: 16,
+      left: 16,
+      right: 16,
+      child: Column(
+        children: [
+          // Search Input
+          Container(
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.12),
+                  blurRadius: 16,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: TextField(
+              controller: _searchController,
+              focusNode: _searchFocusNode,
+              onChanged: _onSearchChanged,
+              onTap: () {
+                setState(() => _isSearchExpanded = true);
+              },
+              style: const TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.w500,
+                color: Colors.black87,
+              ),
+              decoration: InputDecoration(
+                hintText: 'Cari data atau nama tempat...',
+                hintStyle: TextStyle(
+                  color: Colors.grey[400],
+                  fontWeight: FontWeight.w500,
+                  fontSize: 15,
+                ),
+                prefixIcon: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 200),
+                  child: Icon(
+                    _isSearchExpanded ? Icons.search : Icons.search,
+                    key: ValueKey(_isSearchExpanded),
+                    color: _isSearchExpanded
+                        ? const Color(0xFF2E7D32)
+                        : Colors.grey[500],
+                    size: 22,
+                  ),
+                ),
+                suffixIcon: _searchController.text.isNotEmpty
+                    ? IconButton(
+                        icon: Icon(
+                          Icons.close_rounded,
+                          color: Colors.grey[500],
+                          size: 20,
+                        ),
+                        onPressed: () {
+                          _searchController.clear();
+                          _onSearchChanged('');
+                          _searchFocusNode.unfocus();
+                          setState(() => _isSearchExpanded = false);
+                        },
+                      )
+                    : null,
+                border: InputBorder.none,
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 14,
+                ),
+              ),
+            ),
+          ),
+
+          // Search Results Dropdown
+          if (_isSearchExpanded &&
+              _searchController.text.isNotEmpty &&
+              (_searchResults.isNotEmpty || _placeResults.isNotEmpty || _isSearchingPlaces))
+            Container(
+              margin: const EdgeInsets.only(top: 8),
+              constraints: const BoxConstraints(maxHeight: 350),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.1),
+                    blurRadius: 16,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(16),
+                child: ListView(
+                  shrinkWrap: true,
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  children: [
+                    // === SECTION: Data Ubinan ===
+                    if (_searchResults.isNotEmpty) ...[
+                      _buildSectionHeader('Data Ubinan', Icons.spa, const Color(0xFF2E7D32)),
+                      ..._searchResults.map((data) {
+                        final mc = _getMarkerColor(data.cropType);
+                        return _buildDataResultTile(data, mc);
+                      }),
+                    ],
+
+                    // === SECTION: Lokasi / Tempat ===
+                    if (_placeResults.isNotEmpty) ...[
+                      if (_searchResults.isNotEmpty)
+                        Divider(height: 1, color: Colors.grey[200]),
+                      _buildSectionHeader('Lokasi', Icons.place, Colors.blue),
+                      ..._placeResults.map((place) => _buildPlaceResultTile(place)),
+                    ],
+
+                    // Loading indicator geocoding
+                    if (_isSearchingPlaces && _placeResults.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 16, height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.grey[400],
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Text('Mencari lokasi...', style: TextStyle(fontSize: 13, color: Colors.grey[500])),
+                          ],
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+
+          // Empty state
+          if (_isSearchExpanded &&
+              _searchController.text.isNotEmpty &&
+              _searchResults.isEmpty &&
+              _placeResults.isEmpty &&
+              !_isSearchingPlaces)
+            Container(
+              margin: const EdgeInsets.only(top: 8),
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.08),
+                    blurRadius: 12,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.search_off, color: Colors.grey[400], size: 20),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Data tidak ditemukan',
+                    style: TextStyle(color: Colors.grey[500], fontSize: 14, fontWeight: FontWeight.w500),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  // --- HELPER WIDGETS UNTUK SEARCH RESULTS ---
+  Widget _buildSectionHeader(String title, IconData icon, Color color) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: color),
+          const SizedBox(width: 6),
+          Text(title, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w800, color: color, letterSpacing: 0.5)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDataResultTile(UbinanHistory data, Color markerColor) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: () => _goToDataLocation(data),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Row(
+            children: [
+              Container(
+                width: 40, height: 40,
+                decoration: BoxDecoration(color: markerColor.withOpacity(0.1), borderRadius: BorderRadius.circular(10)),
+                child: Icon(Icons.location_on, color: markerColor, size: 22),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(data.title, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.black87), maxLines: 1, overflow: TextOverflow.ellipsis),
+                    const SizedBox(height: 2),
+                    Text(
+                      [if (data.locationName != null && data.locationName!.isNotEmpty) data.locationName!, data.date].join(' • '),
+                      style: TextStyle(fontSize: 12, color: Colors.grey[500], fontWeight: FontWeight.w500),
+                      maxLines: 1, overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(data.result.toStringAsFixed(2), style: TextStyle(fontSize: 14, fontWeight: FontWeight.w800, color: markerColor)),
+                  Text('Ton', style: TextStyle(fontSize: 11, color: Colors.grey[400], fontWeight: FontWeight.w600)),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPlaceResultTile(Map<String, dynamic> place) {
+    final name = place['name'] as String;
+    final parts = name.split(',');
+    final title = parts.first.trim();
+    final subtitle = parts.length > 1 ? parts.sublist(1).join(',').trim() : '';
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: () => _goToPlace(place),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Row(
+            children: [
+              Container(
+                width: 40, height: 40,
+                decoration: BoxDecoration(color: Colors.blue.withOpacity(0.1), borderRadius: BorderRadius.circular(10)),
+                child: const Icon(Icons.place, color: Colors.blue, size: 22),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.black87), maxLines: 1, overflow: TextOverflow.ellipsis),
+                    if (subtitle.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(subtitle, style: TextStyle(fontSize: 12, color: Colors.grey[500], fontWeight: FontWeight.w500), maxLines: 1, overflow: TextOverflow.ellipsis),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Icon(Icons.arrow_forward_ios_rounded, size: 14, color: Colors.grey[400]),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -981,26 +1399,44 @@ class _RiwayatMapsPageState extends State<RiwayatMapsPage> {
               ? const Center(child: CircularProgressIndicator())
               : Stack(
                 children: [
-                  FlutterMap(
-                    mapController: _mapController,
-                    options: MapOptions(
-                      initialCenter: _initialCenter,
-                      initialZoom: _initialZoom,
-                      interactionOptions: const InteractionOptions(
-                        flags: InteractiveFlag.all,
+                  // Tap peta untuk tutup search
+                  GestureDetector(
+                    onTap: () {
+                      if (_isSearchExpanded) {
+                        _searchFocusNode.unfocus();
+                        setState(() {
+                          _isSearchExpanded = false;
+                          if (_searchController.text.isEmpty) {
+                            _searchResults = [];
+                          }
+                        });
+                      }
+                    },
+                    child: FlutterMap(
+                      mapController: _mapController,
+                      options: MapOptions(
+                        initialCenter: _initialCenter,
+                        initialZoom: _initialZoom,
+                        interactionOptions: const InteractionOptions(
+                          flags: InteractiveFlag.all,
+                        ),
                       ),
+                      children: [
+                        TileLayer(
+                          // lyrs=y itu kode rahasia Google untuk "Hybrid" (Satelit + Nama Jalan/Tempat)
+                          urlTemplate:
+                              'https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+                          userAgentPackageName: 'com.example.multicalculator',
+                        ),
+                        MarkerLayer(markers: _markers),
+                      ],
                     ),
-                    children: [
-                      TileLayer(
-                        // lyrs=y itu kode rahasia Google untuk "Hybrid" (Satelit + Nama Jalan/Tempat)
-                        urlTemplate:
-                            'https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                        userAgentPackageName: 'com.example.multicalculator',
-                      ),
-                      MarkerLayer(markers: _markers),
-                    ],
                   ),
-                  // Tombol Floating Recenter (Opsional)
+
+                  // Search Bar
+                  _buildSearchBar(),
+
+                  // Tombol Floating Recenter
                   Positioned(
                     bottom: 20,
                     right: 20,
@@ -1010,7 +1446,7 @@ class _RiwayatMapsPageState extends State<RiwayatMapsPage> {
                       child: const Icon(Icons.my_location, color: Colors.blue),
                       onPressed: () {
                         if (_markers.isNotEmpty) {
-                          // Kembali ke marker pertama
+                          // Kembali ke marker pertama (data terbaru)
                           _mapController.move(_markers.first.point, 15);
                         } else {
                           _mapController.move(_initialCenter, 5);
